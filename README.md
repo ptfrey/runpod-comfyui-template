@@ -18,8 +18,11 @@ In **Create/Edit Template → Config**:
   saved, the field has silently dropped it before):
 
   ```bash
-  bash -c "rm -rf /tmp/rpct && git clone -q --depth 1 https://github.com/ptfrey/runpod-comfyui-template.git /tmp/rpct && cp /tmp/rpct/start.sh /start.sh && chmod +x /start.sh && /start.sh"
+  bash -c "rm -rf /tmp/rpct && git clone -q --depth 1 https://github.com/ptfrey/runpod-comfyui-template.git /tmp/rpct && chmod +x /tmp/rpct/start.sh && /tmp/rpct/start.sh"
   ```
+
+  It runs the script *in place* inside the clone rather than copying it to
+  `/start.sh` — the script reads `workflows/` from its own directory.
 
   Uses `git clone` rather than `curl raw.githubusercontent.com` — GitHub's raw-file
   CDN can serve a stale cached copy for a few minutes after a push, even with a
@@ -39,9 +42,53 @@ you can update `start.sh` and just restart the pod to pick up changes — no reb
    it with `--listen 0.0.0.0 --port 8188`.
 3. Installs JupyterLab (if missing) and launches it on `0.0.0.0:8888`,
    rooted at `/workspace`, **with no token/password**.
-4. Tails `/dev/null` to keep the container's PID 1 alive.
+4. Downloads the Z-Image Base weights in the background (~20 GB) and installs
+   the bundled workflow into ComfyUI's sidebar. See below.
+5. Tails `/dev/null` to keep the container's PID 1 alive.
 
-Logs: `/workspace/logs/start.log`, `/workspace/logs/comfyui.log`, `/workspace/logs/jupyter.log`.
+Logs: `/workspace/logs/start.log`, `/workspace/logs/comfyui.log`,
+`/workspace/logs/jupyter.log`, `/workspace/logs/models.log`.
+
+## Models
+
+Fetched from [`Comfy-Org/z_image`](https://huggingface.co/Comfy-Org/z_image)
+into `/workspace/ComfyUI/models/`:
+
+| File | Destination | Size |
+|---|---|---:|
+| `z_image_bf16.safetensors` | `diffusion_models/` | 12,309,866,400 |
+| `qwen_3_4b.safetensors` | `text_encoders/` | 8,044,982,048 |
+| `ae.safetensors` | `vae/` | 335,304,388 |
+
+Downloads run in the background — the web UIs come up immediately and only
+generation has to wait. Progress is in `/workspace/logs/models.log`.
+
+Two details worth knowing:
+
+- **aria2c with 16 connections, not `curl`.** HuggingFace throttles a single
+  connection to roughly 125 KB/s partway through a large file, which stretches
+  the 8 GB text encoder to about three hours. Parallel connections avoid it.
+- Each file's expected byte count is checked before and after. A file that
+  already matches is skipped, so restarts are free and partial downloads
+  resume rather than starting over.
+
+Set `DOWNLOAD_MODELS=0` as a template env var to skip this entirely.
+
+### Which Z-Image?
+
+This is Z-Image **Base**, matching the bundled workflow: 30 steps, CFG 4.0.
+Z-Image **Turbo** is a different model from a different repo
+(`Comfy-Org/z_image_turbo`) and runs at 8 steps with CFG 1.0. Don't mix the
+settings — Base at 8 steps or Turbo at CFG 4.0 both produce garbage.
+
+## Bundled workflow
+
+`workflows/Realistic_AI_Mirror_Selfie_ZImage_Base_GUI_Workflow.json` is copied
+to `/workspace/ComfyUI/user/default/workflows/` on boot, so it shows up in
+ComfyUI's workflow sidebar. Existing files are never overwritten (`cp -n`), so
+your edits survive a restart.
+
+See `docs-mirror-selfie-workflow.md` for the prompting guide.
 
 ### ⚠️ JupyterLab has no auth
 

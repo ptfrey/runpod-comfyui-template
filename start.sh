@@ -121,7 +121,81 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Keep the container alive (RunPod kills the pod when PID 1 exits).
+# 4. Z-Image Base models + the mirror-selfie workflow.
+#
+#    Runs in the background: ~20GB of weights, and ComfyUI only needs them at
+#    prompt time, so there's no reason to block the UIs on it.
+#
+#    aria2c with 16 connections rather than curl — HuggingFace throttles a
+#    single connection down to ~125KB/s partway through a large file, which
+#    turns an 8GB download into a 3-hour one. Both tools resume, so a killed
+#    or restarted pod picks up where it left off.
+# ---------------------------------------------------------------------------
+DOWNLOAD_MODELS="${DOWNLOAD_MODELS:-1}"
+
+fetch_model() {
+  # fetch_model <dest_dir> <filename> <expected_bytes> <url>
+  local dir="$1" name="$2" want="$3" url="$4"
+  local path="$dir/$name"
+  mkdir -p "$dir"
+  local have
+  have="$(stat -c %s "$path" 2>/dev/null || echo 0)"
+  if [ "$have" = "$want" ]; then
+    echo "[models] $name already complete"
+    return 0
+  fi
+  echo "[models] fetching $name ($((want / 1024 / 1024)) MB)"
+  aria2c -c -x16 -s16 -k4M --summary-interval=60 --console-log-level=warn \
+    -d "$dir" -o "$name" "$url"
+  have="$(stat -c %s "$path" 2>/dev/null || echo 0)"
+  if [ "$have" = "$want" ]; then
+    echo "[models] $name OK"
+  else
+    echo "[models] $name SIZE MISMATCH: got $have, want $want"
+  fi
+}
+
+download_models() {
+  if ! command -v aria2c >/dev/null 2>&1; then
+    echo "[models] installing aria2..."
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq aria2 >/dev/null 2>&1 || {
+      echo "[models] aria2 install failed, skipping model download"
+      return 1
+    }
+  fi
+
+  local M="$COMFY_DIR/models"
+  local HF="https://huggingface.co/Comfy-Org/z_image/resolve/main/split_files"
+
+  fetch_model "$M/diffusion_models" z_image_bf16.safetensors 12309866400 \
+    "$HF/diffusion_models/z_image_bf16.safetensors"
+  fetch_model "$M/text_encoders" qwen_3_4b.safetensors 8044982048 \
+    "$HF/text_encoders/qwen_3_4b.safetensors"
+  fetch_model "$M/vae" ae.safetensors 335304388 \
+    "$HF/vae/ae.safetensors"
+
+  echo "[models] done"
+}
+
+if [ "$DOWNLOAD_MODELS" = "1" ] && [ -d "$COMFY_DIR" ]; then
+  echo "[models] starting background download (log: $LOG_DIR/models.log)"
+  download_models >> "$LOG_DIR/models.log" 2>&1 &
+else
+  echo "[models] skipped (DOWNLOAD_MODELS=$DOWNLOAD_MODELS)"
+fi
+
+# Drop the bundled workflow where ComfyUI's sidebar picks it up.
+WF_SRC="$(dirname "$0")/workflows"
+WF_DST="$COMFY_DIR/user/default/workflows"
+if [ -d "$WF_SRC" ] && [ -d "$COMFY_DIR" ]; then
+  mkdir -p "$WF_DST"
+  cp -n "$WF_SRC"/*.json "$WF_DST/" 2>/dev/null
+  echo "[workflows] installed to $WF_DST"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Keep the container alive (RunPod kills the pod when PID 1 exits).
 # ---------------------------------------------------------------------------
 echo "=== init complete, tailing logs ==="
 tail -f /dev/null
