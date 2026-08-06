@@ -26,6 +26,17 @@ done
 echo "[python] using $PY ($($PY --version 2>&1))"
 
 # ---------------------------------------------------------------------------
+# 0b. Work around a CUDA "forward compatibility" bug: some nvidia/cuda base
+#     images register /usr/local/cuda*/compat in ldconfig BEFORE the real
+#     driver's libcuda.so. That compat shim is Nvidia-restricted to
+#     datacenter GPUs (A100/H100) and refuses to init on GeForce cards,
+#     surfacing as "Error 804: forward compatibility was attempted on non
+#     supported HW" even though nvidia-smi and the device files are fine.
+#     Force the real driver-matched libcuda first via LD_LIBRARY_PATH.
+# ---------------------------------------------------------------------------
+export LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+
+# ---------------------------------------------------------------------------
 # 1. Antigravity CLI (agy) — install once, persisted on the volume so it
 #    survives pod restarts without a full reinstall.
 # ---------------------------------------------------------------------------
