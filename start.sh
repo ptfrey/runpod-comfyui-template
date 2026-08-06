@@ -37,38 +37,62 @@ if [ -x "$AGY_BIN" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. ComfyUI — find install dir, launch listening on all interfaces.
-#    Checks the common locations used by ComfyUI-based images/templates.
+# 2. ComfyUI — clone + install once to /workspace (persists across restarts),
+#    reuse if already there. Falls back to checking a few baked-in image
+#    locations first, in case the base image already ships it.
 # ---------------------------------------------------------------------------
 COMFY_PORT="${COMFY_PORT:-8188}"
-CANDIDATES=(
-  "/workspace/ComfyUI"
-  "/ComfyUI"
-  "/comfyui"
-  "/workspace/comfyui"
-)
+COMFY_DIR="${COMFY_DIR:-/workspace/ComfyUI}"
 
-COMFY_DIR=""
-for d in "${CANDIDATES[@]}"; do
-  if [ -f "$d/main.py" ]; then
-    COMFY_DIR="$d"
-    break
-  fi
-done
+if [ ! -f "$COMFY_DIR/main.py" ]; then
+  for d in /ComfyUI /comfyui; do
+    if [ -f "$d/main.py" ]; then
+      COMFY_DIR="$d"
+      break
+    fi
+  done
+fi
 
-if [ -z "$COMFY_DIR" ]; then
-  echo "[comfyui] main.py not found in known locations (${CANDIDATES[*]})"
-  echo "[comfyui] set COMFY_DIR env var to override, or check the base image layout"
-else
-  echo "[comfyui] found install at $COMFY_DIR — launching on 0.0.0.0:$COMFY_PORT"
+if [ ! -f "$COMFY_DIR/main.py" ]; then
+  echo "[comfyui] not found — cloning to $COMFY_DIR (first boot only, persists on volume)"
+  git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
+  pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt"
+fi
+
+if [ -f "$COMFY_DIR/main.py" ]; then
+  echo "[comfyui] launching $COMFY_DIR on 0.0.0.0:$COMFY_PORT"
   cd "$COMFY_DIR"
   nohup python3 main.py --listen 0.0.0.0 --port "$COMFY_PORT" \
     >> "$LOG_DIR/comfyui.log" 2>&1 &
   echo "[comfyui] pid $!"
+else
+  echo "[comfyui] install failed — check $LOG_DIR/start.log above"
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Keep the container alive (RunPod kills the pod when PID 1 exits).
+# 3. JupyterLab — install if missing, launch token-free on the volume root.
+# ---------------------------------------------------------------------------
+JUPYTER_PORT="${JUPYTER_PORT:-8888}"
+JUPYTER_DIR="${JUPYTER_DIR:-/workspace}"
+
+if ! command -v jupyter-lab >/dev/null 2>&1 && ! python3 -m jupyterlab --version >/dev/null 2>&1; then
+  echo "[jupyter] installing jupyterlab..."
+  pip install --no-cache-dir jupyterlab || echo "[jupyter] install failed, continuing without it"
+fi
+
+if command -v jupyter-lab >/dev/null 2>&1 || python3 -m jupyterlab --version >/dev/null 2>&1; then
+  echo "[jupyter] launching on 0.0.0.0:$JUPYTER_PORT (dir: $JUPYTER_DIR, no token/password)"
+  mkdir -p "$JUPYTER_DIR"
+  nohup python3 -m jupyterlab \
+    --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root \
+    --notebook-dir="$JUPYTER_DIR" \
+    --ServerApp.token='' --ServerApp.password='' \
+    >> "$LOG_DIR/jupyter.log" 2>&1 &
+  echo "[jupyter] pid $!"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Keep the container alive (RunPod kills the pod when PID 1 exits).
 # ---------------------------------------------------------------------------
 echo "=== init complete, tailing logs ==="
 tail -f /dev/null

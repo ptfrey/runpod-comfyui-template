@@ -7,14 +7,19 @@ Init script for a RunPod Pod template: starts ComfyUI and installs the
 
 In **Create/Edit Template → Config**:
 
-- **Container image**: `runpod/worker-comfyui:main-base` (or your own ComfyUI image)
+- **Container image**: `runpod/pytorch:1.0.3-cu1290-torch290-ubuntu2204` (or any current
+  `runpod/pytorch` tag — check [Docker Hub](https://hub.docker.com/r/runpod/pytorch/tags)
+  for the latest CUDA/torch combo). **Do not use `runpod/worker-comfyui:*`** — that image
+  is a serverless-worker build with its own baked-in entrypoint that runs a local
+  self-test and never hands off to a custom Start Command; it'll crash-loop instead
+  of running this script.
 - **Start command**:
 
   ```bash
   bash -c "curl -fsSL https://raw.githubusercontent.com/ptfrey/runpod-comfyui-template/main/start.sh -o /start.sh && chmod +x /start.sh && /start.sh"
   ```
 
-- **Expose HTTP port**: `8188` (ComfyUI web UI)
+- **Expose HTTP ports**: `8188` (ComfyUI web UI), `8888` (JupyterLab)
 - **Persistent storage**: mounted at `/workspace` (used for logs + Antigravity install cache)
 
 Pulling the script from GitHub at boot (rather than baking it into the image) means
@@ -23,11 +28,23 @@ you can update `start.sh` and just restart the pod to pick up changes — no reb
 ## What it does
 
 1. Installs `agy` (Antigravity CLI) to `~/.local/bin` if not already present.
-2. Locates ComfyUI (`main.py`) in common install paths and launches it with
-   `--listen 0.0.0.0 --port 8188`.
-3. Tails `/dev/null` to keep the container's PID 1 alive.
+2. Clones ComfyUI + installs its `requirements.txt` into `/workspace/ComfyUI` on
+   first boot only (persists on the volume — skipped on restart), then launches
+   it with `--listen 0.0.0.0 --port 8188`.
+3. Installs JupyterLab (if missing) and launches it on `0.0.0.0:8888`,
+   rooted at `/workspace`, **with no token/password**.
+4. Tails `/dev/null` to keep the container's PID 1 alive.
 
-Logs: `/workspace/logs/start.log`, `/workspace/logs/comfyui.log`.
+Logs: `/workspace/logs/start.log`, `/workspace/logs/comfyui.log`, `/workspace/logs/jupyter.log`.
+
+### ⚠️ JupyterLab has no auth
+
+Anyone with the pod's RunPod proxy URL for port 8888 gets a full code-exec
+shell. RunPod URLs aren't indexed/guessable, but they're not secret either.
+For longer-lived pods, set a token instead of blanking it:
+in `start.sh`, replace `--ServerApp.token=''` with
+`--ServerApp.token="$JUPYTER_TOKEN"` and set `JUPYTER_TOKEN` as a template
+env var.
 
 ## First-time Antigravity auth
 
