@@ -10,6 +10,22 @@ exec > >(tee -a "$LOG_DIR/start.log") 2>&1
 echo "=== [$(date -u +%FT%TZ)] runpod-comfyui-template start.sh ==="
 
 # ---------------------------------------------------------------------------
+# 0. Pick the Python that actually has torch/CUDA installed. Some RunPod
+#    base images ship multiple pythons (e.g. /usr/bin/python3 -> 3.10 with
+#    nothing in it, /usr/bin/python3.12 with torch + everything preinstalled)
+#    where bare `python3`/`pip` resolve inconsistently. Pinning avoids
+#    installing into one interpreter and launching with another.
+# ---------------------------------------------------------------------------
+PY="python3"
+for cand in python3.12 python3.11 python3.10; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import torch" >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
+done
+echo "[python] using $PY ($($PY --version 2>&1))"
+
+# ---------------------------------------------------------------------------
 # 1. Antigravity CLI (agy) — install once, persisted on the volume so it
 #    survives pod restarts without a full reinstall.
 # ---------------------------------------------------------------------------
@@ -56,13 +72,13 @@ fi
 if [ ! -f "$COMFY_DIR/main.py" ]; then
   echo "[comfyui] not found — cloning to $COMFY_DIR (first boot only, persists on volume)"
   git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
-  pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt"
+  "$PY" -m pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt"
 fi
 
 if [ -f "$COMFY_DIR/main.py" ]; then
   echo "[comfyui] launching $COMFY_DIR on 0.0.0.0:$COMFY_PORT"
   cd "$COMFY_DIR"
-  nohup python3 main.py --listen 0.0.0.0 --port "$COMFY_PORT" \
+  nohup "$PY" main.py --listen 0.0.0.0 --port "$COMFY_PORT" \
     >> "$LOG_DIR/comfyui.log" 2>&1 &
   echo "[comfyui] pid $!"
 else
@@ -75,20 +91,22 @@ fi
 JUPYTER_PORT="${JUPYTER_PORT:-8888}"
 JUPYTER_DIR="${JUPYTER_DIR:-/workspace}"
 
-if ! command -v jupyter-lab >/dev/null 2>&1 && ! python3 -m jupyterlab --version >/dev/null 2>&1; then
+if ! "$PY" -m jupyterlab --version >/dev/null 2>&1; then
   echo "[jupyter] installing jupyterlab..."
-  pip install --no-cache-dir jupyterlab || echo "[jupyter] install failed, continuing without it"
+  "$PY" -m pip install --no-cache-dir jupyterlab || echo "[jupyter] install failed, continuing without it"
 fi
 
-if command -v jupyter-lab >/dev/null 2>&1 || python3 -m jupyterlab --version >/dev/null 2>&1; then
+if "$PY" -m jupyterlab --version >/dev/null 2>&1; then
   echo "[jupyter] launching on 0.0.0.0:$JUPYTER_PORT (dir: $JUPYTER_DIR, no token/password)"
   mkdir -p "$JUPYTER_DIR"
-  nohup python3 -m jupyterlab \
+  nohup "$PY" -m jupyterlab \
     --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root \
     --notebook-dir="$JUPYTER_DIR" \
     --ServerApp.token='' --ServerApp.password='' \
     >> "$LOG_DIR/jupyter.log" 2>&1 &
   echo "[jupyter] pid $!"
+else
+  echo "[jupyter] not available — check $LOG_DIR/start.log above"
 fi
 
 # ---------------------------------------------------------------------------
