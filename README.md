@@ -13,11 +13,17 @@ In **Create/Edit Template → Config**:
   is a serverless-worker build with its own baked-in entrypoint that runs a local
   self-test and never hands off to a custom Start Command; it'll crash-loop instead
   of running this script.
-- **Start command**:
+- **Start command** (click "Start command" in the template config, paste into the
+  field it opens — it overrides the image's Docker `CMD`; verify it actually
+  saved, the field has silently dropped it before):
 
   ```bash
-  bash -c "curl -fsSL https://raw.githubusercontent.com/ptfrey/runpod-comfyui-template/main/start.sh -o /start.sh && chmod +x /start.sh && /start.sh"
+  bash -c "rm -rf /tmp/rpct && git clone -q --depth 1 https://github.com/ptfrey/runpod-comfyui-template.git /tmp/rpct && cp /tmp/rpct/start.sh /start.sh && chmod +x /start.sh && /start.sh"
   ```
+
+  Uses `git clone` rather than `curl raw.githubusercontent.com` — GitHub's raw-file
+  CDN can serve a stale cached copy for a few minutes after a push, even with a
+  cache-busting query string. `git clone` always gets the latest commit.
 
 - **Expose HTTP ports**: `8188` (ComfyUI web UI), `8888` (JupyterLab)
 - **Persistent storage**: mounted at `/workspace` (used for logs + Antigravity install cache)
