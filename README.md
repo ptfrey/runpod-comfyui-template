@@ -52,6 +52,38 @@ in `start.sh`, replace `--ServerApp.token=''` with
 `--ServerApp.token="$JUPYTER_TOKEN"` and set `JUPYTER_TOKEN` as a template
 env var.
 
+## Troubleshooting
+
+### HTTP 403 "Access to `<pod>-8188.proxy.runpod.net` was denied"
+
+One proxy port 403s while another (e.g. 8888) loads fine, and the service is
+demonstrably up (`ss -lntp` shows it listening, `curl` from outside returns 200).
+
+Cause: a stale RunPod auth cookie on `.proxy.runpod.net` in your browser. It's
+`HttpOnly` and `SameSite`-scoped, so it's sent on top-level page navigations but
+omitted on cross-site subresource requests — which is why the *same URL* loads as
+an `<img>` but 403s in the address bar. Clearing the cache doesn't remove it.
+
+Fix: Chrome → Settings → Privacy → Third-party cookies → *See all site data* →
+search `runpod.net` → delete → reload. Confirm first in an incognito window
+(no cookies) — if it loads there, this is it.
+
+Nothing in `start.sh` can fix this; the cookie is client-side.
+
+### `RuntimeError: CUDA unknown error` / `torch.cuda.is_available()` is False
+
+Two distinct causes, distinguished by the error text:
+
+- **`Error 804: forward compatibility was attempted on non supported HW`** —
+  the image registers `/usr/local/cuda-*/compat` ahead of the real driver in
+  `ldconfig`. That shim is Nvidia-restricted to datacenter GPUs and fails on
+  GeForce cards. Already handled by the `LD_LIBRARY_PATH` line in `start.sh`.
+  Confirm with `ldconfig -p | grep "libcuda.so.1 "` — two entries means the bug
+  is present.
+- **Generic "CUDA unknown error", no 804, empty `/dev/nvidia-caps`** — host-side
+  RunPod flake. `nvidia-smi` works, CUDA init doesn't. Not fixable from the
+  container. Terminate and deploy a new pod.
+
 ## First-time Antigravity auth
 
 This is a headless pod, so the first time you run `agy` in a terminal (e.g. via
