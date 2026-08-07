@@ -126,10 +126,17 @@ fi
 #    Runs in the background: ~20GB of weights, and ComfyUI only needs them at
 #    prompt time, so there's no reason to block the UIs on it.
 #
-#    aria2c with 16 connections rather than curl — HuggingFace throttles a
-#    single connection down to ~125KB/s partway through a large file, which
-#    turns an 8GB download into a 3-hour one. Both tools resume, so a killed
-#    or restarted pod picks up where it left off.
+#    curl, NOT aria2c. HuggingFace now serves large files from
+#    us.aws.cdn.hf.co/xet-bridge-us behind a signed, expiring URL. aria2's
+#    parallel connections each re-request the redirect and get 403'd, so
+#    `-x16` fails outright. Measured on a RunPod host against the Turbo unet:
+#
+#      curl -sSL          575 MB / 8s   ~72 MB/s
+#      aria2c -x1 -s1     130 MB / 8s   ~16 MB/s
+#      aria2c -x16 -s16   403 Forbidden
+#
+#    `curl -C -` resumes, so a killed or restarted pod still picks up where
+#    it left off.
 # ---------------------------------------------------------------------------
 DOWNLOAD_MODELS="${DOWNLOAD_MODELS:-1}"
 
@@ -146,24 +153,30 @@ HF_MIN_MBPS="${HF_MIN_MBPS:-0}"
 SPEED_FILE="$LOG_DIR/hf_speed.json"
 
 hf_speedtest() {
-  # Samples against the real Turbo unet with -c, so the bytes fetched are kept
-  # and resumed later rather than wasted on a throwaway file.
-  local dir="$1" name="$2" url="$3"
+  # Samples against the real Turbo unet with `curl -C -`, so the bytes fetched
+  # are kept and resumed later rather than wasted on a throwaway file.
+  local dir="$1" name="$2" want="$3" url="$4"
   mkdir -p "$dir"
   local path="$dir/$name"
 
   local before after delta mbps eta verdict
-  # --file-allocation=none keeps the file sparse, so disk usage (du) tracks
-  # bytes actually received. Plain `stat -c %s` would report the full
-  # preallocated length immediately and measure nothing.
   before="$(du -B1 "$path" 2>/dev/null | cut -f1 || echo 0)"
   before="${before:-0}"
 
+  # On a restart the file may already be complete, in which case `curl -C -`
+  # returns instantly, delta is 0, and we'd wrongly declare the link dead.
+  # Nothing left to measure, and nothing left to download either.
+  if [ "$(stat -c %s "$path" 2>/dev/null || echo 0)" = "$want" ]; then
+    echo "[speedtest] skipped — $name already complete"
+    printf '{"mbps":-1,"verdict":"skipped","eta_min":0,"sampled_bytes":0,"secs":0}\n' \
+      > "$SPEED_FILE"
+    HF_MBPS=-1
+    return 0
+  fi
+
   echo "[speedtest] sampling HuggingFace for ${HF_SPEED_TEST_SECS}s..."
   timeout "$HF_SPEED_TEST_SECS" \
-    aria2c -c -x16 -s16 -k4M --file-allocation=none \
-      --console-log-level=error --summary-interval=0 \
-      -d "$dir" -o "$name" "$url" >/dev/null 2>&1
+    curl -sSL -C - -o "$path" "$url" >/dev/null 2>&1
 
   after="$(du -B1 "$path" 2>/dev/null | cut -f1 || echo 0)"
   after="${after:-0}"
@@ -212,8 +225,8 @@ fetch_model() {
     return 0
   fi
   echo "[models] fetching $name ($((want / 1024 / 1024)) MB)"
-  aria2c -c -x16 -s16 -k4M --summary-interval=60 --console-log-level=warn \
-    -d "$dir" -o "$name" "$url"
+  # -C - resumes a partial file; --retry survives a transient CDN hiccup.
+  curl -sSL -C - --retry 3 --retry-delay 2 -o "$path" "$url"
   have="$(stat -c %s "$path" 2>/dev/null || echo 0)"
   if [ "$have" = "$want" ]; then
     echo "[models] $name OK"
@@ -222,12 +235,12 @@ fetch_model() {
   fi
 }
 
-ensure_aria2() {
-  command -v aria2c >/dev/null 2>&1 && return 0
-  echo "[models] installing aria2..."
+ensure_curl() {
+  command -v curl >/dev/null 2>&1 && return 0
+  echo "[models] installing curl..."
   apt-get update -qq >/dev/null 2>&1
-  apt-get install -y -qq aria2 >/dev/null 2>&1 || {
-    echo "[models] aria2 install failed"
+  apt-get install -y -qq curl >/dev/null 2>&1 || {
+    echo "[models] curl install failed"
     return 1
   }
 }
@@ -262,13 +275,15 @@ if [ "$DOWNLOAD_MODELS" = "1" ] && [ -d "$COMFY_DIR" ]; then
   # The speed test runs in the FOREGROUND (~12s) so its verdict lands in
   # start.log where you'll actually see it on boot, rather than scrolling past
   # in the background models.log. Only the bulk download is backgrounded.
-  HF_MBPS=0
-  if ensure_aria2; then
-    hf_speedtest "$M_DIR/diffusion_models" z_image_turbo_bf16.safetensors \
+  HF_MBPS=-1
+  if ensure_curl; then
+    hf_speedtest "$M_DIR/diffusion_models" z_image_turbo_bf16.safetensors 12309866400 \
       "$HFT/diffusion_models/z_image_turbo_bf16.safetensors"
   fi
 
-  if [ "$HF_MIN_MBPS" -gt 0 ] && [ "$HF_MBPS" -lt "$HF_MIN_MBPS" ]; then
+  # HF_MBPS of -1 means "not measured" (already complete, or curl missing) —
+  # never let that trip the abort.
+  if [ "$HF_MIN_MBPS" -gt 0 ] && [ "$HF_MBPS" -ge 0 ] && [ "$HF_MBPS" -lt "$HF_MIN_MBPS" ]; then
     echo "[models] ABORTED: ${HF_MBPS} MB/s is below HF_MIN_MBPS=${HF_MIN_MBPS}."
     echo "[models] Nothing downloaded — terminate this pod and deploy another,"
     echo "[models] or restart with a lower HF_MIN_MBPS."

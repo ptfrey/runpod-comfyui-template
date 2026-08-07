@@ -72,14 +72,51 @@ generation has to wait. Progress is in `/workspace/logs/models.log`.
 
 Two details worth knowing:
 
-- **aria2c with 16 connections, not `curl`.** HuggingFace throttles a single
-  connection to roughly 125 KB/s partway through a large file, which stretches
-  the 8 GB text encoder to about three hours. Parallel connections avoid it.
+- **`curl`, not `aria2c`.** HuggingFace serves large files from
+  `us.aws.cdn.hf.co/xet-bridge-us` behind a signed, expiring URL. aria2's
+  parallel connections each re-request the redirect and get `403`, so `-x16`
+  fails outright — and even `-x1` is far slower. Measured on a RunPod host
+  against the 12 GB Turbo unet:
+
+  | Method | 8s sample | Rate |
+  |---|---:|---:|
+  | `curl -sSL` | 575 MB | ~72 MB/s |
+  | `aria2c -x1 -s1` | 130 MB | ~16 MB/s |
+  | `aria2c -x16 -s16` | — | 403 Forbidden |
+
+  `curl -C -` resumes, so restarts stay free.
 - Each file's expected byte count is checked before and after. A file that
   already matches is skipped, so restarts are free and partial downloads
   resume rather than starting over.
 
 Set `DOWNLOAD_MODELS=0` as a template env var to skip this entirely.
+
+### Speed test
+
+HuggingFace throughput varies wildly between RunPod hosts — the same 33 GB is
+~6 minutes on a good machine and over an hour on a bad one. Rather than find
+out 40 minutes in, boot samples the link first and prints the verdict to
+`start.log`:
+
+```
+[speedtest] sampling HuggingFace for 12s...
+[speedtest] 84 MB/s — good (est. 6 min for ~33GB)
+```
+
+It probes the real Turbo unet with `curl -C -`, so the bytes it pulls are kept
+and resumed by the download that follows — the test costs 12 seconds, not a
+wasted transfer. Verdicts: `good` ≥ 40 MB/s, `ok` ≥ 15, `slow` below that,
+which also prints a banner suggesting you re-roll the pod. Machine-readable
+copy lands in `/workspace/logs/hf_speed.json`:
+
+```json
+{"mbps":84,"verdict":"good","eta_min":6,"sampled_bytes":887046144,"secs":12}
+```
+
+| Env var | Default | Effect |
+|---|---:|---|
+| `HF_SPEED_TEST_SECS` | `12` | Sample duration |
+| `HF_MIN_MBPS` | `0` (off) | Below this, skip the download entirely so a bad pod is obvious in seconds |
 
 ### Which Z-Image?
 
