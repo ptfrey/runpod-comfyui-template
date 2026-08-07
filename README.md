@@ -51,14 +51,21 @@ Logs: `/workspace/logs/start.log`, `/workspace/logs/comfyui.log`,
 
 ## Models
 
-Fetched from [`Comfy-Org/z_image`](https://huggingface.co/Comfy-Org/z_image)
-into `/workspace/ComfyUI/models/`:
+Fetched from [`Comfy-Org/z_image_turbo`](https://huggingface.co/Comfy-Org/z_image_turbo)
+and [`Comfy-Org/z_image`](https://huggingface.co/Comfy-Org/z_image) into
+`/workspace/ComfyUI/models/`, **in this order**:
 
-| File | Destination | Size |
-|---|---|---:|
-| `z_image_bf16.safetensors` | `diffusion_models/` | 12,309,866,400 |
-| `qwen_3_4b.safetensors` | `text_encoders/` | 8,044,982,048 |
-| `ae.safetensors` | `vae/` | 335,304,388 |
+| # | File | Destination | Size |
+|--:|---|---|---:|
+| 1 | `z_image_turbo_bf16.safetensors` | `diffusion_models/` | 12,309,866,400 |
+| 2 | `qwen_3_4b.safetensors` | `text_encoders/` | 8,044,982,048 |
+| 3 | `ae.safetensors` | `vae/` | 335,304,388 |
+| 4 | `z_image_bf16.safetensors` | `diffusion_models/` | 12,309,866,400 |
+
+Turbo comes first because it's the few-step model — you can start generating
+with it soonest. The text encoder and VAE are shared by both models, so they're
+fetched before the second 12 GB unet; once item 3 lands, Turbo is fully usable
+while Base is still downloading. Total is roughly 33 GB.
 
 Downloads run in the background — the web UIs come up immediately and only
 generation has to wait. Progress is in `/workspace/logs/models.log`.
@@ -76,10 +83,13 @@ Set `DOWNLOAD_MODELS=0` as a template env var to skip this entirely.
 
 ### Which Z-Image?
 
-This is Z-Image **Base**, matching the bundled workflow: 30 steps, CFG 4.0.
-Z-Image **Turbo** is a different model from a different repo
-(`Comfy-Org/z_image_turbo`) and runs at 8 steps with CFG 1.0. Don't mix the
-settings — Base at 8 steps or Turbo at CFG 4.0 both produce garbage.
+Both are installed. The bundled workflow targets **Base** — 30 steps, CFG 4.0.
+**Turbo** is a distilled few-step model and needs 8 steps with CFG 1.0. Don't
+mix the settings: Base at 8 steps or Turbo at CFG 4.0 both produce garbage.
+Switch models in `UNETLoader` and change the sampler settings together.
+
+LoRAs are also build-specific — a `ZImageBase` LoRA won't work on Turbo and
+vice versa, unless its CivitAI page explicitly says it covers both.
 
 ## Bundled workflow
 

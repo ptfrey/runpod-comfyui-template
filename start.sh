@@ -133,6 +133,73 @@ fi
 # ---------------------------------------------------------------------------
 DOWNLOAD_MODELS="${DOWNLOAD_MODELS:-1}"
 
+# Throughput from HuggingFace to a given RunPod host varies enormously — the
+# same 33GB of weights is ~6 minutes on a good machine and over an hour on a
+# bad one. Measure it up front so you can kill the pod and re-roll instead of
+# discovering it 40 minutes later.
+#
+# HF_SPEED_TEST_SECS  how long to sample                     (default 12)
+# HF_MIN_MBPS         below this, skip downloads entirely so
+#                     the pod is obviously re-rollable        (default 0 = never skip)
+HF_SPEED_TEST_SECS="${HF_SPEED_TEST_SECS:-12}"
+HF_MIN_MBPS="${HF_MIN_MBPS:-0}"
+SPEED_FILE="$LOG_DIR/hf_speed.json"
+
+hf_speedtest() {
+  # Samples against the real Turbo unet with -c, so the bytes fetched are kept
+  # and resumed later rather than wasted on a throwaway file.
+  local dir="$1" name="$2" url="$3"
+  mkdir -p "$dir"
+  local path="$dir/$name"
+
+  local before after delta mbps eta verdict
+  # --file-allocation=none keeps the file sparse, so disk usage (du) tracks
+  # bytes actually received. Plain `stat -c %s` would report the full
+  # preallocated length immediately and measure nothing.
+  before="$(du -B1 "$path" 2>/dev/null | cut -f1 || echo 0)"
+  before="${before:-0}"
+
+  echo "[speedtest] sampling HuggingFace for ${HF_SPEED_TEST_SECS}s..."
+  timeout "$HF_SPEED_TEST_SECS" \
+    aria2c -c -x16 -s16 -k4M --file-allocation=none \
+      --console-log-level=error --summary-interval=0 \
+      -d "$dir" -o "$name" "$url" >/dev/null 2>&1
+
+  after="$(du -B1 "$path" 2>/dev/null | cut -f1 || echo 0)"
+  after="${after:-0}"
+  delta=$(( after - before ))
+  [ "$delta" -lt 0 ] && delta=0
+
+  mbps=$(( delta / 1048576 / HF_SPEED_TEST_SECS ))
+  # 33GB total for turbo + base + encoder + vae
+  if [ "$mbps" -gt 0 ]; then
+    eta=$(( 33792 / mbps / 60 ))
+  else
+    eta=-1
+  fi
+
+  if   [ "$mbps" -ge 40 ]; then verdict=good
+  elif [ "$mbps" -ge 15 ]; then verdict=ok
+  else                          verdict=slow
+  fi
+
+  printf '{"mbps":%d,"verdict":"%s","eta_min":%d,"sampled_bytes":%d,"secs":%d}\n' \
+    "$mbps" "$verdict" "$eta" "$delta" "$HF_SPEED_TEST_SECS" > "$SPEED_FILE"
+
+  echo "[speedtest] ${mbps} MB/s — $verdict (est. ${eta} min for ~33GB)"
+  if [ "$verdict" = "slow" ]; then
+    echo "[speedtest] ############################################################"
+    echo "[speedtest] #  SLOW HUGGINGFACE LINK (${mbps} MB/s)"
+    echo "[speedtest] #  ~33GB will take roughly ${eta} minutes on this host."
+    echo "[speedtest] #  Consider terminating this pod and deploying another."
+    echo "[speedtest] ############################################################"
+  fi
+
+  # Set a global rather than echoing the value — stdout is teed to the log,
+  # so $(hf_speedtest ...) would swallow every message above.
+  HF_MBPS="$mbps"
+}
+
 fetch_model() {
   # fetch_model <dest_dir> <filename> <expected_bytes> <url>
   local dir="$1" name="$2" want="$3" url="$4"
@@ -155,32 +222,60 @@ fetch_model() {
   fi
 }
 
+ensure_aria2() {
+  command -v aria2c >/dev/null 2>&1 && return 0
+  echo "[models] installing aria2..."
+  apt-get update -qq >/dev/null 2>&1
+  apt-get install -y -qq aria2 >/dev/null 2>&1 || {
+    echo "[models] aria2 install failed"
+    return 1
+  }
+}
+
+M_DIR="$COMFY_DIR/models"
+HF="https://huggingface.co/Comfy-Org/z_image/resolve/main/split_files"
+# Turbo ships from its own repo, not Comfy-Org/z_image.
+HFT="https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files"
+
 download_models() {
-  if ! command -v aria2c >/dev/null 2>&1; then
-    echo "[models] installing aria2..."
-    apt-get update -qq >/dev/null 2>&1
-    apt-get install -y -qq aria2 >/dev/null 2>&1 || {
-      echo "[models] aria2 install failed, skipping model download"
-      return 1
-    }
-  fi
+  local M="$M_DIR"
 
-  local M="$COMFY_DIR/models"
-  local HF="https://huggingface.co/Comfy-Org/z_image/resolve/main/split_files"
+  # Turbo first: it's the few-step model, so it's the one you can actually
+  # generate with while the rest is still downloading. Base follows.
+  fetch_model "$M/diffusion_models" z_image_turbo_bf16.safetensors 12309866400 \
+    "$HFT/diffusion_models/z_image_turbo_bf16.safetensors"
 
-  fetch_model "$M/diffusion_models" z_image_bf16.safetensors 12309866400 \
-    "$HF/diffusion_models/z_image_bf16.safetensors"
+  # The text encoder and VAE are shared by Turbo and Base — fetch them before
+  # the second 12GB unet so Turbo is actually usable as early as possible.
   fetch_model "$M/text_encoders" qwen_3_4b.safetensors 8044982048 \
     "$HF/text_encoders/qwen_3_4b.safetensors"
   fetch_model "$M/vae" ae.safetensors 335304388 \
     "$HF/vae/ae.safetensors"
 
+  fetch_model "$M/diffusion_models" z_image_bf16.safetensors 12309866400 \
+    "$HF/diffusion_models/z_image_bf16.safetensors"
+
   echo "[models] done"
 }
 
 if [ "$DOWNLOAD_MODELS" = "1" ] && [ -d "$COMFY_DIR" ]; then
-  echo "[models] starting background download (log: $LOG_DIR/models.log)"
-  download_models >> "$LOG_DIR/models.log" 2>&1 &
+  # The speed test runs in the FOREGROUND (~12s) so its verdict lands in
+  # start.log where you'll actually see it on boot, rather than scrolling past
+  # in the background models.log. Only the bulk download is backgrounded.
+  HF_MBPS=0
+  if ensure_aria2; then
+    hf_speedtest "$M_DIR/diffusion_models" z_image_turbo_bf16.safetensors \
+      "$HFT/diffusion_models/z_image_turbo_bf16.safetensors"
+  fi
+
+  if [ "$HF_MIN_MBPS" -gt 0 ] && [ "$HF_MBPS" -lt "$HF_MIN_MBPS" ]; then
+    echo "[models] ABORTED: ${HF_MBPS} MB/s is below HF_MIN_MBPS=${HF_MIN_MBPS}."
+    echo "[models] Nothing downloaded — terminate this pod and deploy another,"
+    echo "[models] or restart with a lower HF_MIN_MBPS."
+  else
+    echo "[models] starting background download (log: $LOG_DIR/models.log)"
+    download_models >> "$LOG_DIR/models.log" 2>&1 &
+  fi
 else
   echo "[models] skipped (DOWNLOAD_MODELS=$DOWNLOAD_MODELS)"
 fi
